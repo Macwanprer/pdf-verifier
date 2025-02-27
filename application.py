@@ -17,7 +17,7 @@ def check_title_page(pdf_path):
     """Check if the PDF contains a title page based on keywords."""
     try:
         reader = PdfReader(pdf_path)
-        for page_num, page in enumerate(reader.pages[:5]):  # Check first 5 pages
+        for page_num, page in enumerate(reader.pages):
             text = page.extract_text().lower() if page.extract_text() else ""
             title_keywords = ["title", "contents", "abstract", "introduction"]
             if any(keyword in text for keyword in title_keywords):
@@ -26,90 +26,103 @@ def check_title_page(pdf_path):
     except Exception as e:
         return f"Error checking title page: {e}"
 
-def check_pdf_readability(pdf_path, threshold=50):
-    """Check the readability of the PDF using text extraction and OCR, return True/False and confidence."""
+def check_pdf_readability(pdf_path, threshold=50, handwriting=False, language='eng'):
+    """Check the readability of the PDF using text extraction and OCR, with optional handwriting detection."""
     try:
-        # Extract text using PyPDF2
         reader = PdfReader(pdf_path)
         extracted_text = "".join(page.extract_text() or "" for page in reader.pages)
         if extracted_text.strip():
-            return True, 100  # Considered readable with 100% confidence if there is any extracted text
+            return True, 100
 
-        # Fallback to OCR for non-readable PDFs
         images = convert_from_path(pdf_path, dpi=300)
         ocr_confidences = []
-        for image in images[:3]:  # Limit to first 3 pages for performance
+
+        for image in images:
             try:
-                ocr_data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
-                for conf in ocr_data['conf']:
-                    if conf.isdigit() and int(conf) > 0:  # Ignore invalid or zero-confidence values
-                        ocr_confidences.append(int(conf))
+                if handwriting:
+                    ocr_text = pytesseract.image_to_string(image, lang=language)
+                else:
+                    ocr_data = pytesseract.image_to_data(image, lang=language, output_type=pytesseract.Output.DICT)
+                    for conf in ocr_data['conf']:
+                        if isinstance(conf, int) and conf > 0:
+                            ocr_confidences.append(conf)
             except Exception:
                 pass
 
         if ocr_confidences:
             avg_confidence = sum(ocr_confidences) / len(ocr_confidences)
-            return avg_confidence >= threshold, avg_confidence  # Return True if confidence is above threshold
+            return avg_confidence >= threshold, round(avg_confidence, 2)
         else:
-            return False, 0  # If no OCR confidence, mark as non-readable
-    except Exception as e:
-        return False, 0  # In case of an error, mark as non-readable
-    return False, 0
+            return False, 0
+    except Exception:
+        return False, 0
+
+def check_duplicate_files(uploaded_files):
+    """Check if files are uploaded more than once."""
+    file_names = [file.name for file in uploaded_files]
+    duplicates = {name for name in file_names if file_names.count(name) > 1}
+    return duplicates
+
+def check_file_format(uploaded_file):
+    """Ensure the uploaded file is a valid PDF."""
+    return uploaded_file.name.lower().endswith('.pdf')
+
+def save_temp_pdf(uploaded_file):
+    """Save uploaded file temporarily."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_pdf:
+        temp_pdf.write(uploaded_file.read())
+        return temp_pdf.name
 
 # --- Frontend (Streamlit) ---
 st.set_page_config(page_title="PDF Verifier", layout="centered")
 
-# Add a Sidebar for Instructions and Settings
 with st.sidebar:
     st.header("PDF Verifier Settings")
     st.write("Upload your PDFs to check the title page and readability.")
-    st.write("### OCR Settings")
     confidence_threshold = st.slider("Set OCR Confidence Threshold (%)", 0, 100, 50, 5)
     st.write(f"Current Threshold: {confidence_threshold}%")
+    handwriting_option = st.checkbox("Enable Handwritten Text Recognition")
+    language_option = st.selectbox("Select OCR Language", ["eng", "spa", "fra", "deu", "ita", "jpn", "chi_sim", "chi_tra"])
 
-# Main Content Area
 st.title("PDF Verifier")
-st.write(
-    "Upload one or more PDF files to check the readability and title page status. "
-    "The app will analyze the first few pages for text extraction and OCR analysis."
-)
+st.write("Upload PDF files to check readability, duplicate uploads, and title page status.")
 
-# File Upload Section
+st.markdown("""
+    <style>
+        .stFileUploader { border: 2px dashed #ccc; padding: 20px; text-align: center; }
+    </style>
+""", unsafe_allow_html=True)
+
 uploaded_files = st.file_uploader("Upload PDF file(s)", type="pdf", accept_multiple_files=True)
 
-# Process uploaded files
 if uploaded_files:
+    duplicate_files = check_duplicate_files(uploaded_files)
     results = []
     progress_bar = st.progress(0)
 
     for idx, uploaded_file in enumerate(uploaded_files):
-        # Show Progress
         progress_bar.progress((idx + 1) / len(uploaded_files))
-
-        # Save uploaded file temporarily
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_pdf:
-            temp_pdf.write(uploaded_file.read())
-            temp_pdf_path = temp_pdf.name
-
-        # Process the PDF
+        
+        if not check_file_format(uploaded_file):
+            results.append({"File Name": uploaded_file.name, "Error": "Invalid file format"})
+            continue
+        
+        temp_pdf_path = save_temp_pdf(uploaded_file)
         title_page_status = check_title_page(temp_pdf_path)
-        is_readable, confidence = check_pdf_readability(temp_pdf_path, threshold=confidence_threshold)
+        is_readable, confidence = check_pdf_readability(temp_pdf_path, threshold=confidence_threshold, handwriting=handwriting_option, language=language_option)
 
-        # Append results
         results.append({
             "File Name": uploaded_file.name,
+            "Duplicate File": "Yes" if uploaded_file.name in duplicate_files else "No",
             "Title Page Status": title_page_status,
             "Is Readable (True/False)": "Yes" if is_readable else "No",
-            "Confidence (%)": round(confidence, 2) if confidence > 0 else "N/A"
+            "Confidence (%)": f"{round(confidence, 2)}%"
         })
 
-        # Cleanup
         os.remove(temp_pdf_path)
 
-    # Convert results to DataFrame
     results_df = pd.DataFrame(results)
 
-    # Styling the DataFrame
     def colorize_results(val):
         if val == "Yes":
             return "background-color: green; color: white;"
@@ -117,11 +130,9 @@ if uploaded_files:
             return "background-color: red; color: white;"
         return ""
 
-    # Write results into the placeholder
     st.write("### Verification Results")
     st.dataframe(results_df.style.applymap(colorize_results, subset=["Is Readable (True/False)"]))
 
-    # Provide a Downloadable Summary
     summary_csv = results_df.to_csv(index=False).encode("utf-8")
     st.download_button(
         label="Download Summary CSV",
@@ -130,6 +141,5 @@ if uploaded_files:
         mime="text/csv"
     )
 
-# Footer Section
 st.write("---")
-st.write("This tool helps you analyze PDFs for title pages and readability. Adjust OCR settings using the sidebar.")
+st.write("PDF Verifier Tool")
